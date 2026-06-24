@@ -1,60 +1,54 @@
 const http = require('http');
-const { WebSocketServer } = require('ws');
+const WebSocket = require('ws');
 
-const PORT = process.env.PORT || 10000;
-let activeTunnel = null;
-const requestsMap = new Map();
-
+// إنشاء سيرفر HTTP عادي يتوافق مع Render
 const server = http.createServer((req, res) => {
-    // إذا كان جهازك غير متصل بالنفق
-    if (!activeTunnel || activeTunnel.readyState !== 1) {
-        res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-        return res.end('502 Bad Gateway: النفق مغلق، شغل client.js في جهازك.');
+    if (!localClientSocket || localClientSocket.readyState !== WebSocket.OPEN) {
+        res.writeHead(502, { 'Content-Type': 'text/plain' });
+        return res.end('Bad Gateway: Local machine is offline.');
     }
 
-    const id = Math.random().toString(36).substring(2);
-    const chunks = [];
-    
-    req.on('data', chunk => chunks.push(chunk));
+    // تجميع طلب الزائر لإرساله لجهازك
+    let body = '';
+    req.on('data', chunk => body += chunk);
     req.on('end', () => {
-        requestsMap.set(id, res);
-        
-        // إرسال الطلب لجهازك
-        const payload = {
-            id,
+        const requestData = {
             method: req.method,
             url: req.url,
             headers: req.headers,
-            body: Buffer.concat(chunks).toString('base64')
+            body: body
         };
+
+        localClientSocket.send(JSON.stringify(requestData));
+
+        const responseHandler = (message) => {
+            const responseData = JSON.parse(message);
+            res.writeHead(responseData.status, responseData.headers);
+            res.end(responseData.body);
+            localClientSocket.off('message', responseHandler);
+        };
+        localClientSocket.on('message', responseHandler);
+    });
+});
+
+// دمج سيرفر الـ WebSocket داخل نفس سيرفر الـ HTTP (حل مشكلة البورت الواحد)
+const wss = new WebSocket.Server({ noServer: true });
+let localClientSocket = null;
+
+server.on('upgrade', (request, socket, head) => {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+        console.log('⚡ جهازك المحلي اتصل بالنفق بنجاح!');
+        localClientSocket = ws;
         
-        try {
-            activeTunnel.send(JSON.stringify(payload));
-        } catch (e) {
-            res.writeHead(502);
-            res.end('Proxy Error');
-            requestsMap.delete(id);
-        }
+        ws.on('close', () => {
+            console.log('❌ انقطع اتصال الجهاز المحلي.');
+            localClientSocket = null;
+        });
     });
 });
 
-const wss = new WebSocketServer({ server });
-wss.on('connection', (ws) => {
-    console.log('🟩 Connected');
-    activeTunnel = ws;
-
-    ws.on('message', (message) => {
-        try {
-            const response = JSON.parse(message.toString());
-            const originalRes = requestsMap.get(response.id);
-            
-            if (originalRes) {
-                originalRes.writeHead(response.status, response.headers);
-                originalRes.end(Buffer.from(response.body, 'base64'));
-                requestsMap.delete(response.id);
-            }
-        } catch (e) {}
-    });
+// الاستماع للبورت الممنوح من Render تلقائياً
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`🚀 Proxy running on port ${PORT}`);
 });
-
-server.listen(PORT);
