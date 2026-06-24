@@ -1,130 +1,60 @@
 const http = require('http');
-const { WebSocketServer } = require('ws');
-const crypto = require('crypto');
-
 const PORT = process.env.PORT || 10000;
-const pendingRequests = new Map();
-let activeClient = null;
 
-// 1. استقبال طلبات الـ HTTP من المتصفح
+let queue = [];
+let responses = new Map();
+
 const server = http.createServer((req, res) => {
-    // إذا كان العميل غير متصل أو الاتصال ميت، نرد فوراً بـ 502 بدلاً من التعليق
-    if (!activeClient || activeClient.readyState !== 1) {
-        res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-        return res.end('502 Bad Gateway: جهازك المحلي غير متصل بالنفق حالياً أو في حالة خمول.');
+    // 1. نقطة اتصال خاصة بجهازك المحلي لسحب طلبات الزوار
+    if (req.url === '/get-local-reqs') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(queue));
+        queue = []; // تفريغ الطابور بعد السحب
+        return;
     }
 
-    const requestId = crypto.randomUUID();
-    const chunks = [];
+    // 2. نقطة اتصال خاصة بجهازك المحلي لتسليم الردود
+    if (req.url.startsWith('/submit-local-res/')) {
+        const reqId = req.url.split('/').pop();
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', () => {
+            const data = JSON.parse(body);
+            const originalRes = responses.get(reqId);
+            if (originalRes) {
+                originalRes.writeHead(data.status, data.headers);
+                originalRes.end(Buffer.from(data.body, 'base64'));
+                responses.delete(reqId);
+            }
+            res.writeHead(200);
+            res.end('OK');
+        });
+        return;
+    }
 
-    req.on('data', chunk => chunks.push(chunk));
+    // 3. استقبال طلبات الزوار العاديين وحفظها في الطابور
+    const reqId = Math.random().toString(36).substring(2);
+    let reqBody = '';
+    req.on('data', chunk => reqBody += chunk);
     req.on('end', () => {
-        const bodyBuffer = Buffer.concat(chunks);
-        
-        const requestData = {
-            id: requestId,
+        queue.push({
+            id: reqId,
             method: req.method,
             url: req.url,
             headers: req.headers,
-            body: bodyBuffer.toString('base64')
-        };
+            body: Buffer.from(reqBody).toString('base64')
+        });
+        responses.set(reqId, res);
 
-        // 🌟 حماية قصوى: مهلة 15 ثانية فقط لقطع الشك باليقين والرد قبل أن يتدخل سيرفر Render بـ 504
-        const timeout = setTimeout(() => {
-            if (pendingRequests.has(requestId)) {
-                const pending = pendingRequests.get(requestId);
-                try {
-                    pending.res.writeHead(504, { 'Content-Type': 'text/plain; charset=utf-8' });
-                    pending.res.end('504 Gateway Timeout: السيرفر المحلي استغرق وقتاً طويلاً جداً ولم يستجب.');
-                } catch (e) {}
-                pendingRequests.delete(requestId);
+        // حماية من التعليق: إذا لم يسحب جهازك الطلب خلال 10 ثوانٍ نغلقه بـ 504
+        setTimeout(() => {
+            if (responses.has(reqId)) {
+                responses.get(reqId).writeHead(504, { 'Content-Type': 'text/plain' });
+                responses.get(reqId).end('504 Timeout: Local client did not poll in time.');
+                responses.delete(reqId);
             }
-        }, 15000);
-
-        pendingRequests.set(requestId, { res, timeout });
-        
-        // إرسال الطلب مع فحص فوري لوجود خطأ في الإرسال
-        try {
-            activeClient.send(JSON.stringify(requestData), (err) => {
-                if (err) {
-                    clearTimeout(timeout);
-                    res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-                    res.end('502 Bad Gateway: فشل إرسال البيانات عبر النفق الميت.');
-                    pendingRequests.delete(requestId);
-                }
-            });
-        } catch (err) {
-            clearTimeout(timeout);
-            res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-            res.end('502 Bad Gateway: خطأ غير متوقع في قناة الاتصال.');
-            pendingRequests.delete(requestId);
-        }
+        }, 10000);
     });
 });
 
-// 2. دمج الـ WebSocketServer
-const wss = new WebSocketServer({ noServer: true });
-
-server.on('upgrade', (request, socket, head) => {
-    wss.handleUpgrade(request, socket, head, (ws) => {
-        wss.emit('connection', ws, request);
-    });
-});
-
-wss.on('connection', (ws) => {
-    console.log('🟩 تم ربط جهازك المحلي بالنفق بنجاح!');
-    activeClient = ws;
-    ws.isAlive = true;
-
-    // 🌟 نظام نبضات القلب (Heartbeat): للتأكد التام أن الاتصال حقيقي وليس وهمياً
-    const pingInterval = setInterval(() => {
-        if (ws.isAlive === false) {
-            console.log('🟥 العميل لم يستجب للـ Ping. يتم إغلاق الاتصال الميت فوراً.');
-            return ws.terminate();
-        }
-        ws.isAlive = false;
-        try { ws.ping(); } catch (e) { ws.terminate(); }
-    }, 30000); // يفحص كل 30 ثانية
-
-    ws.on('pong', () => {
-        ws.isAlive = true; // العميل رد بأنه حي، الاتصال سليم!
-    });
-
-    ws.on('message', (message) => {
-        try {
-            const responseData = JSON.parse(message.toString());
-            const pending = pendingRequests.get(responseData.id);
-
-            if (pending) {
-                clearTimeout(pending.timeout); // إلغاء التايم آوت فوراً
-                
-                const headers = responseData.headers || {};
-                delete headers['connection'];
-                delete headers['transfer-encoding'];
-
-                pending.res.writeHead(responseData.status || 200, headers);
-                const bodyBuffer = Buffer.from(responseData.body || '', 'base64');
-                pending.res.end(bodyBuffer);
-                
-                pendingRequests.delete(responseData.id);
-            }
-        } catch (err) {
-            console.error('❌ خطأ أثناء معالجة رد الكلاينت:', err);
-        }
-    });
-
-    ws.on('close', () => {
-        console.log('🟥 انقطع اتصال الجهاز المحلي بالنفق.');
-        clearInterval(pingInterval);
-        if (activeClient === ws) activeClient = null;
-    });
-
-    ws.on('error', (err) => {
-        console.error('🚨 خطأ في سوكت العميل:', err.message);
-        ws.terminate();
-    });
-});
-
-server.listen(PORT, () => {
-    console.log(`🚀 سيرفر النفق يعمل بنجاح على بورت ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Proxy server running on port ${PORT}`));
