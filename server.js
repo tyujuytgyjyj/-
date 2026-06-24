@@ -1,10 +1,11 @@
 const http = require('http');
 const WebSocket = require('ws');
+const url = require('url'); // 🌟 مكتبة مدمجة لتحليل الروابط
 
 const pendingRequests = new Map();
 
 const server = http.createServer((req, res) => {
-    // فحص الصحة القياسي لـ Render ليبقى السيرفر يعمل دائماً بوضع Live
+    // فحص الصحة القياسي لـ Render ليبقى السيرفر Live في المتصفح
     if (req.url === '/' || req.url === '/health' || req.url === '/ping') {
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
         return res.end('🚀 سيرفر النفق يعمل بنجاح ومستعد لاستقبال الاتصالات الموثقة.');
@@ -57,10 +58,12 @@ setInterval(() => {
 }, 30000);
 
 server.on('upgrade', (request, socket, head) => {
-    // 🌟 الحل السحري: التحقق من الهيدر السري القادم من جهازك مباشرة وحصراً
-    if (request.headers['x-tunnel-auth'] === 'my-super-secret-token-123') {
+    // 🌟 استخراج التوكن السري من رابط الاتصال مباشرة
+    const parsedUrl = url.parse(request.url, true);
+    
+    if (parsedUrl.query.token === 'my-super-secret-token-123') {
         wss.handleUpgrade(request, socket, head, (ws) => {
-            console.log('⚡ تم ربط العميل المحلي بالنفق الخارجي بنجاح تام وبشكل آمن!');
+            console.log('⚡ تم ربط العميل المحلي بالنفق بنجاح عبر التوكن الآمن!');
             
             if (localClientSocket && localClientSocket.readyState === WebSocket.OPEN) {
                 localClientSocket.close();
@@ -105,7 +108,7 @@ server.on('upgrade', (request, socket, head) => {
             });
         });
     } else {
-        // رفض اتصالات المتصفح العشوائية (مثل اسكربتات التحديث التلقائي) بكود 401 غير مصرح له لحماية النفق
+        // رفض أي اتصال لا يحتوي على التوكن الصحيح في الرابط
         socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
         socket.destroy();
     }
