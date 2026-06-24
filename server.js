@@ -7,9 +7,16 @@ const pendingRequests = new Map();
 let activeClient = null;
 
 const server = http.createServer((req, res) => {
+    // حماية: إذا حاول متصفح دخول مسار النفق بالخطأ نمنعه
+    if (req.url === '/tunnel-secure') {
+        res.writeHead(400);
+        return res.end('WS connection required');
+    }
+
+    // إذا كان النفق مغلقاً أو العميل غير متصل
     if (!activeClient || activeClient.readyState !== 1) {
         res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-        return res.end('502 Bad Gateway: النفق مغلق حالياً أو الكلاينت يفصل ويصل.');
+        return res.end('502 Bad Gateway: النفق مغلق تماماً، تأكد من تشغيل ملف client.js الجديد في جهازك.');
     }
 
     const requestId = crypto.randomUUID();
@@ -30,7 +37,7 @@ const server = http.createServer((req, res) => {
                 const pending = pendingRequests.get(requestId);
                 try {
                     pending.res.writeHead(504, { 'Content-Type': 'text/plain; charset=utf-8' });
-                    pending.res.end('504 Gateway Timeout: السيرفر المحلي لم يستجب.');
+                    pending.res.end('504 Gateway Timeout: المشروع المحلي على بورت 4000 لم يستجب.');
                 } catch(e){}
                 pendingRequests.delete(requestId);
             }
@@ -42,23 +49,38 @@ const server = http.createServer((req, res) => {
         } catch (err) {
             clearTimeout(timeout);
             res.writeHead(502);
-            res.end('502 Bad Gateway');
+            res.end('502 Bad Gateway: انقطع الاتصال بالنفق.');
             pendingRequests.delete(requestId);
         }
     });
 });
 
-const wss = new WebSocketServer({ server });
+// إعداد سوكت معزول وخاص بطلب الـ Upgrade يدوياً ليتوافق 100% مع بيئة Render
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (request, socket, head) => {
+    if (request.url === '/tunnel-secure') {
+        wss.handleUpgrade(request, socket, head, (ws) => {
+            wss.emit('connection', ws, request);
+        });
+    } else {
+        socket.destroy();
+    }
+});
+
 wss.on('connection', (ws) => {
-    console.log('🟩 جهاز العميل اتصل بالنفق!');
+    console.log('🟩 [Render] تم فتح النفق بنجاح واستقبال اتصال جهازك المحلي.');
     activeClient = ws;
 
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message.toString());
             
-            // 🌟 تجاهل رسالة نبضات القلب القادمة من جهازك (فقط للحفاظ على الاتصال حياً)
-            if (data.type === 'heartbeat') return;
+            // الرد الفوري على نبضات القلب القادمة من جهازك لتبقي الخط مفتوحاً رغماً عن جدار الحماية
+            if (data.type === 'ping') {
+                ws.send(JSON.stringify({ type: 'pong' }));
+                return;
+            }
 
             const pending = pendingRequests.get(data.id);
             if (pending) {
@@ -78,4 +100,6 @@ wss.on('connection', (ws) => {
     });
 });
 
-server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+process.on('uncaughtException', (err) => console.error('Global Error:', err.message));
+
+server.listen(PORT, () => console.log(`🚀 Tunnel Server running on port ${PORT}`));
