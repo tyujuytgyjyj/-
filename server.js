@@ -1,154 +1,97 @@
 const http = require('http');
-const WebSocket = require('ws');
+const { WebSocketServer } = require('ws');
+const crypto = require('crypto');
 
+const PORT = process.env.PORT || 10000;
 const pendingRequests = new Map();
-let localClientSocket = null;
+let activeClient = null;
 
+// 1. إنشاء سيرفر HTTP لاستقبال طلبات الزوار
 const server = http.createServer((req, res) => {
-    // 1. مسار الفحص القياسي لـ Render ليبقى السيرفر Live دائماً
-    if (req.url === '/render-health-check' || req.url === '/ping') {
-        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-        return res.end('🚀 Connected');
-    }
-
-    // 2. فحص بصمة الكوكيز للشاشة الترحيبية
-    const cookies = req.headers.cookie || '';
-    const hasPassedSplash = cookies.includes('hamida_passed=true');
-
-    // إظهار شاشة الانتظار فقط عند الدخول لأول مرة على الرابط الرئيسي '/'
-    if (req.url === '/' && !hasPassedSplash) {
-        // زرع الكوكيز في متصفح الزائر وتنتهي صلاحيته بعد ساعة تلقائياً
-        res.writeHead(200, {
-            'Set-Cookie': 'hamida_passed=true; Path=/; Max-Age=3600;',
-            'Content-Type': 'text/html; charset=utf-8'
-        });
-        return res.end(`
-            <!DOCTYPE html>
-            <html lang="ar" dir="rtl">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>انتظار التوجيه...</title>
-                <style>
-                    body {
-                        background-color: #000000;
-                        color: #ffffff;
-                        font-family: sans-serif;
-                        display: flex;
-                        justify-content: center;
-                        align-items: center;
-                        height: 100vh;
-                        margin: 0;
-                        font-size: 32px;
-                        font-weight: bold;
-                    }
-                    .waiting-text { animation: pulse 1.5s infinite ease-in-out; }
-                    @keyframes pulse { 0%, 100% { opacity: 0.5; } 50% { opacity: 1; } }
-                </style>
-            </head>
-            <body>
-                <div class="waiting-text">يا حميدة منتضر انتضر...</div>
-                <script>
-                    // الانتظار ثانيتين ثم تحديث الصفحة بشكل نظيف ودون التلاعب بالروابط
-                    setTimeout(() => {
-                        window.location.reload();
-                    }, 2000);
-                </script>
-            </body>
-            </html>
-        `);
-    }
-
-    // 3. تمرير الطلب عبر النفق إذا كان الزائر يملك البصمة أو يطلب ملفات أخرى (CSS, JS, إلخ)
-    if (!localClientSocket || localClientSocket.readyState !== WebSocket.OPEN) {
+    // إذا كان جهازك المحلي غير متصل بالنفق، نرد فوراً بـ 502 بدل التعليق
+    if (!activeClient || activeClient.readyState !== 1) {
         res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-        return res.end('502 Bad Gateway: الجهاز المحلي غير متصل بالنفق حالياً.');
+        return res.end('502 Bad Gateway: جهازك المحلي غير متصل بالنفق حالياً.');
     }
 
-    let chunks = [];
+    const requestId = crypto.randomUUID(); // توليد ID فريد لكل طلب
+    const chunks = [];
+
     req.on('data', chunk => chunks.push(chunk));
     req.on('end', () => {
-        const reqId = Date.now().toString(36) + Math.random().toString(36).substring(2);
         const bodyBuffer = Buffer.concat(chunks);
-
+        
         const requestData = {
-            id: reqId,
+            id: requestId,
             method: req.method,
             url: req.url,
             headers: req.headers,
-            body: bodyBuffer.toString('base64')
+            body: bodyBuffer.toString('base64') // تحويل البودي لـ base64 لحمايته من التلف
         };
 
-        pendingRequests.set(reqId, res);
-        
-        try {
-            localClientSocket.send(JSON.stringify(requestData));
-        } catch (err) {
-            res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-            res.end('502 Bad Gateway: فشل إرسال البيانات للنفق.');
-            pendingRequests.delete(reqId);
-            return;
-        }
-
-        // مهلة أمان قصيرة (20 ثانية) لتجنب تعليق سيرفر Render وإعطاء خطأ مخصص ومفهوم
-        setTimeout(() => {
-            if (pendingRequests.has(reqId)) {
-                const resObj = pendingRequests.get(reqId);
-                if (!resObj.headersSent) {
-                    resObj.writeHead(504, { 'Content-Type': 'text/plain; charset=utf-8' });
-                    resObj.end('504 Gateway Timeout: استغرق السيرفر المحلي وقتاً طويلاً جداً للاستجابة.');
-                }
-                pendingRequests.delete(reqId);
+        // حماية قصوى: إذا لم يستجب جهازك خلال 20 ثانية، ننهي الطلب لمنع الـ 504
+        const timeout = setTimeout(() => {
+            if (pendingRequests.has(requestId)) {
+                const pending = pendingRequests.get(requestId);
+                pending.res.writeHead(504, { 'Content-Type': 'text/plain; charset=utf-8' });
+                pending.res.end('504 Gateway Timeout: السيرفر المحلي استغرق وقتاً طويلاً في الاستجابة.');
+                pendingRequests.delete(requestId);
             }
         }, 20000);
+
+        // حفظ استجابة الـ HTTP في الذاكرة لربطها لاحقاً برد الـ WebSocket
+        pendingRequests.set(requestId, { res, timeout });
+        
+        // إرسال الطلب فوراً لجهازك عبر النفق
+        activeClient.send(JSON.stringify(requestData));
     });
 });
 
-const wss = new WebSocket.Server({ noServer: true });
+// 2. دمج سيرفر الـ WebSocket مع سيرفر الـ HTTP
+const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (request, socket, head) => {
     wss.handleUpgrade(request, socket, head, (ws) => {
-        localClientSocket = ws;
-        console.log('⚡ تم ربط الكلاينت المحلي بالنفق!');
-
-        ws.on('message', (message) => {
-            try {
-                const responseData = JSON.parse(message.toString());
-                if (!responseData.id) return;
-
-                const res = pendingRequests.get(responseData.id);
-                if (res) {
-                    const resBuffer = Buffer.from(responseData.body || '', 'base64');
-                    const cleanHeaders = { ...responseData.headers };
-                    
-                    delete cleanHeaders['transfer-encoding']; 
-                    delete cleanHeaders['connection'];
-                    cleanHeaders['content-length'] = resBuffer.length.toString();
-
-                    res.writeHead(responseData.status || 200, cleanHeaders);
-                    res.end(resBuffer);
-                    pendingRequests.delete(responseData.id);
-                }
-            } catch (error) {
-                console.error('خطأ في معالجة الرد:', error.message);
-            }
-        });
-
-        ws.on('close', () => {
-            if (localClientSocket === ws) {
-                localClientSocket = null;
-                // حماية فورية: تنظيف وإغلاق أي طلبات معلقة فور انقطاع اتصال الكمبيوتر لمنع الـ 502 الطويل
-                pendingRequests.forEach((res) => {
-                    if (!res.headersSent) {
-                        res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-                        res.end('502 Bad Gateway: انقطع اتصال النفق فجأة.');
-                    }
-                });
-                pendingRequests.clear();
-            }
-        });
+        wss.emit('connection', ws, request);
     });
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Proxy running on port ${PORT}`));
+wss.on('connection', (ws) => {
+    console.log('🟩 تم ربط جهازك المحلي بالنفق بنجاح!');
+    activeClient = ws;
+
+    ws.on('message', (message) => {
+        try {
+            const responseData = JSON.parse(message.toString());
+            const pending = pendingRequests.get(responseData.id);
+
+            if (pending) {
+                clearTimeout(pending.timeout); // إلغاء التايم آوت فوراً لوصول الرد
+                
+                const headers = responseData.headers || {};
+                // تنظيف الهيدرز لمنع تعليق المتصفح
+                delete headers['connection'];
+                delete headers['transfer-encoding'];
+
+                pending.res.writeHead(responseData.status || 200, headers);
+                
+                // تحويل الرد القادم من جهازك من base64 إلى ملفات أصيلة (صور، نصوص، كود)
+                const bodyBuffer = Buffer.from(responseData.body || '', 'base64');
+                pending.res.end(bodyBuffer);
+                
+                pendingRequests.delete(responseData.id);
+            }
+        } catch (err) {
+            console.error('❌ خطأ أثناء معالجة رد الكلاينت:', err);
+        }
+    });
+
+    ws.on('close', () => {
+        console.log('🟥 انقطع اتصال الجهاز المحلي بالنفق.');
+        if (activeClient === ws) activeClient = null;
+    });
+});
+
+server.listen(PORT, () => {
+    console.log(`🚀 سيرفر النفق يعمل بنجاح على بورت ${PORT}`);
+});
