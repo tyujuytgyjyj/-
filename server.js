@@ -1,92 +1,103 @@
 const http = require('http');
 const WebSocket = require('ws');
 
-// خريطة لتخزين الطلبات المعلقة لربط كل رد بالزائر الصحيح
 const pendingRequests = new Map();
 
 const server = http.createServer((req, res) => {
-    // 1. مسار فحص الصحة (مهم جداً لمنع Render من إعادة تشغيل السيرفر)
+    // مسار فحص الصحة الخاص بـ Render
     if (req.url === '/health' || req.url === '/ping') {
         res.writeHead(200, { 'Content-Type': 'text/plain' });
         return res.end('OK');
     }
 
-    // 2. التحقق من اتصال جهازك
     if (!localClientSocket || localClientSocket.readyState !== WebSocket.OPEN) {
-        res.writeHead(502, { 'Content-Type': 'text/plain' });
-        return res.end('Bad Gateway: Local machine is offline.');
+        res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('502 Bad Gateway: الجهاز المحلي غير متصل بالنفق حالياً.');
     }
 
-    // 3. تجميع الطلب وإرساله مع ID فريد
-    let body = '';
-    req.on('data', chunk => body += chunk);
+    // تجميع البيانات كـ Buffer (وليس كـ String) لدعم الصور والملفات دون تلف
+    let chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
     req.on('end', () => {
-        // توليد معرف فريد لكل طلب لتجنب تداخل زوار الموقع
         const reqId = Date.now().toString(36) + Math.random().toString(36).substring(2);
+        const bodyBuffer = Buffer.concat(chunks);
 
         const requestData = {
             id: reqId,
             method: req.method,
             url: req.url,
             headers: req.headers,
-            body: body
+            body: bodyBuffer.toString('base64') // تشفير آمن لنقل البيانات عبر الـ WebSocket
         };
 
-        // حفظ كائن الرد لنتمكن من إرسال البيانات له لاحقاً
         pendingRequests.set(reqId, res);
         localClientSocket.send(JSON.stringify(requestData));
 
-        // مهلة زمنية (Timeout) لتجنب تعليق الطلب للأبد في حال لم يرد جهازك
+        // مهلة زمنية 30 ثانية
         setTimeout(() => {
             if (pendingRequests.has(reqId)) {
                 const resObj = pendingRequests.get(reqId);
                 if (!resObj.headersSent) {
                     resObj.writeHead(504, { 'Content-Type': 'text/plain' });
-                    resObj.end('Gateway Timeout: Local machine took too long to respond.');
+                    resObj.end('504 Gateway Timeout: الجهاز المحلي استغرق وقتاً طويلاً للرد.');
                 }
                 pendingRequests.delete(reqId);
             }
-        }, 30000); // 30 ثانية
+        }, 30000);
     });
 });
 
 const wss = new WebSocket.Server({ noServer: true });
 let localClientSocket = null;
 
+// نبضات القلب لمنع فصل الاتصال تلقائياً
+setInterval(() => {
+    wss.clients.forEach((ws) => {
+        if (ws.isAlive === false) return ws.terminate();
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, 30000);
+
 server.on('upgrade', (request, socket, head) => {
     wss.handleUpgrade(request, socket, head, (ws) => {
-        console.log('⚡ جهازك المحلي اتصل بالنفق بنجاح!');
-        
-        // إغلاق أي اتصال قديم معلق لتجنب التعارض
         if (localClientSocket && localClientSocket.readyState === WebSocket.OPEN) {
             localClientSocket.close();
         }
         localClientSocket = ws;
+        ws.isAlive = true;
 
-        // استلام الردود من جهازك المحلي
+        ws.on('pong', () => ws.isAlive = true);
+
         ws.on('message', (message) => {
             try {
-                const responseData = JSON.parse(message);
-                const res = pendingRequests.get(responseData.id); // جلب الزائر الخاص بهذا الرد
+                const responseData = JSON.parse(message.toString());
+                const res = pendingRequests.get(responseData.id);
                 
                 if (res) {
-                    res.writeHead(responseData.status, responseData.headers);
-                    res.end(responseData.body);
-                    pendingRequests.delete(responseData.id); // تنظيف الذاكرة
+                    const resBuffer = Buffer.from(responseData.body, 'base64');
+                    
+                    // تنظيف الـ Headers القادمة وإجبار السيرفر على احتساب الحجم الفعلي الجديد
+                    const cleanHeaders = { ...responseData.headers };
+                    delete cleanHeaders['transfer-encoding']; 
+                    delete cleanHeaders['connection'];
+                    cleanHeaders['content-length'] = resBuffer.length.toString();
+
+                    res.writeHead(responseData.status, cleanHeaders);
+                    res.end(resBuffer);
+                    pendingRequests.delete(responseData.id);
                 }
             } catch (error) {
-                console.error('خطأ في قراءة الرد:', error.message);
+                console.error('خطأ في معالجة الرد الزائر:', error.message);
             }
         });
 
         ws.on('close', () => {
-            console.log('❌ انقطع اتصال الجهاز المحلي.');
-            localClientSocket = null;
-            // إنهاء جميع الطلبات المعلقة بخطأ 502 للمستخدمين
+            if (localClientSocket === ws) localClientSocket = null;
             pendingRequests.forEach((res) => {
                 if (!res.headersSent) {
                     res.writeHead(502, { 'Content-Type': 'text/plain' });
-                    res.end('Bad Gateway: Local machine disconnected.');
+                    res.end('502 Bad Gateway: Connection Lost.');
                 }
             });
             pendingRequests.clear();
@@ -95,6 +106,4 @@ server.on('upgrade', (request, socket, head) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`🚀 Proxy running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`🚀 Proxy running on port ${PORT}`));
