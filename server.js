@@ -1,46 +1,60 @@
 const http = require('http');
-const httpProxy = require('http-proxy');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 10000;
-
-// إنشاء الـ Proxy المفتوح المصدر
-const proxy = httpProxy.createProxyServer({
-    target: {
-        host: '127.0.0.1',
-        port: 4000 // البورت الافتراضي لمشروعك
-    },
-    ws: true
-});
+let activeTunnel = null;
+const requestsMap = new Map();
 
 const server = http.createServer((req, res) => {
-    // هنا يتم تمرير أي طلب قادم من الإنترنت تلقائياً إلى التفق
-    if (activeTargetSocket && activeTargetSocket.readyState === 1) {
-        // توجيه الطلب عبر البروكسي
-        proxy.web(req, res, { target: 'http://127.0.0.1:4000' }, (err) => {
+    // إذا كان جهازك غير متصل بالنفق
+    if (!activeTunnel || activeTunnel.readyState !== 1) {
+        res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('502 Bad Gateway: النفق مغلق، شغل client.js في جهازك.');
+    }
+
+    const id = Math.random().toString(36).substring(2);
+    const chunks = [];
+    
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+        requestsMap.set(id, res);
+        
+        // إرسال الطلب لجهازك
+        const payload = {
+            id,
+            method: req.method,
+            url: req.url,
+            headers: req.headers,
+            body: Buffer.concat(chunks).toString('base64')
+        };
+        
+        try {
+            activeTunnel.send(JSON.stringify(payload));
+        } catch (e) {
             res.writeHead(502);
-            res.end('Reverse Proxy Error');
-        });
-    } else {
-        res.writeHead(502);
-        res.end('502 Bad Gateway: Local tunnel client is offline.');
-    }
+            res.end('Proxy Error');
+            requestsMap.delete(id);
+        }
+    });
 });
 
-// فتح سوكت مخصص فقط لربط جهازك المحلي بالسيرفر
-const wss = new WebSocketServer({ noServer: true });
-let activeTargetSocket = null;
+const wss = new WebSocketServer({ server });
+wss.on('connection', (ws) => {
+    console.log('🟩 Connected');
+    activeTunnel = ws;
 
-server.on('upgrade', (request, socket, head) => {
-    if (request.url === '/tunnel-connect') {
-        wss.handleUpgrade(request, socket, head, (ws) => {
-            activeTargetSocket = ws;
-            console.log('🟩 الجهاز المحلي متصل بالبروكسي بنجاح!');
-        });
-    } else {
-        // إذا كان الطلب عبارة عن WebSocket عادي من مشروعك (بورت 4000)
-        proxy.ws(request, socket, head);
-    }
+    ws.on('message', (message) => {
+        try {
+            const response = JSON.parse(message.toString());
+            const originalRes = requestsMap.get(response.id);
+            
+            if (originalRes) {
+                originalRes.writeHead(response.status, response.headers);
+                originalRes.end(Buffer.from(response.body, 'base64'));
+                requestsMap.delete(response.id);
+            }
+        } catch (e) {}
+    });
 });
 
-server.listen(PORT, () => console.log(`🚀 Open-Source Proxy running on port ${PORT}`));
+server.listen(PORT);
