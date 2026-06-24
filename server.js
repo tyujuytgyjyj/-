@@ -5,13 +5,13 @@ const pendingRequests = new Map();
 let localClientSocket = null;
 
 const server = http.createServer((req, res) => {
-    // مسار الفحص الخاص بـ Render ليبقى السيرفر مستيقظاً و Live دائماً
+    // مسار الفحص الخاص بـ Render ليبقى السيرفر Live دائماً
     if (req.url === '/render-health-check' || req.url === '/ping') {
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-        return res.end('🚀 سيرفر النفق مستيقظ ويعمل في الخلفية بنجاح.');
+        return res.end('🚀 Connected');
     }
 
-    // 🌟 1. إذا دخل الشخص على الرابط الأساسي مباشرة (تظهر له رسالة الانتظار)
+    // 🌟 1. إظهار شاشة الانتظار عند الدخول على الرابط الأساسي مباشرة
     if (req.url === '/') {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         return res.end(`
@@ -23,9 +23,9 @@ const server = http.createServer((req, res) => {
                 <title>انتظار التوجيه...</title>
                 <style>
                     body {
-                        background-color: #000000; /* خلفية سوداء بالكامل */
-                        color: #ffffff; /* كتابة بيضاء متناسقة */
-                        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                        background-color: #000000;
+                        color: #ffffff;
+                        font-family: sans-serif;
                         display: flex;
                         justify-content: center;
                         align-items: center;
@@ -34,21 +34,14 @@ const server = http.createServer((req, res) => {
                         font-size: 32px;
                         font-weight: bold;
                     }
-                    .waiting-text {
-                        animation: pulse 1.5s infinite ease-in-out;
-                    }
-                    @keyframes pulse {
-                        0% { opacity: 0.5; }
-                        50% { opacity: 1; }
-                        100% { opacity: 0.5; }
-                    }
+                    .waiting-text { animation: pulse 1.5s infinite ease-in-out; }
+                    @keyframes pulse { 0%, 100% { opacity: 0.5; } 50% { opacity: 1; } }
                 </style>
             </head>
             <body>
                 <div class="waiting-text">يا حميدة منتضر انتضر...</div>
-
                 <script>
-                    // 🌟 الانتظار لمدة ثانيتين (2000ms) ثم التوجيه للرابط السري الخاص بالنفق
+                    // الانتظار ثانيتين (2000ms) ثم التوجيه للرابط الممرر
                     setTimeout(() => {
                         window.location.href = '/?passed=true';
                     }, 2000);
@@ -58,15 +51,15 @@ const server = http.createServer((req, res) => {
         `);
     }
 
-    // 🌟 2. إذا جاء الطلب ويحمل العبارة السرية (يعني أنه انتظر ثانيتين بالفعل)
+    // 🌟 2. إذا تم تخطي شاشة الانتظار بنجاح، نقوم بتمريره للسيرفر المحلي
     if (req.url === '/?passed=true') {
-        req.url = '/'; // نُعيد تسمية الرابط إلى '/' لكي يفهمه سيرفرك المحلي كصفحة رئيسية عادية دون أخطاء
+        req.url = '/'; 
     }
 
-    // التحقق من اتصال جهازك بالنفق
+    // التحقق من اتصال الكلاينت بالنفق
     if (!localClientSocket || localClientSocket.readyState !== WebSocket.OPEN) {
         res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-        return res.end('502 Bad Gateway: السيرفر المحلي (جهازك) غير متصل بالنفق حالياً.');
+        return res.end('502 Bad Gateway: الجهاز المحلي غير متصل حالياً.');
     }
 
     let chunks = [];
@@ -86,16 +79,17 @@ const server = http.createServer((req, res) => {
         pendingRequests.set(reqId, res);
         localClientSocket.send(JSON.stringify(requestData));
 
+        // وقت مستقطع للأمان لمنع التعليق اللانهائي
         setTimeout(() => {
             if (pendingRequests.has(reqId)) {
                 const resObj = pendingRequests.get(reqId);
                 if (!resObj.headersSent) {
                     resObj.writeHead(504, { 'Content-Type': 'text/plain; charset=utf-8' });
-                    resObj.end('504 Gateway Timeout');
+                    resObj.end('504 Gateway Timeout: استغرق السيرفر المحلي وقتاً طويلاً.');
                 }
                 pendingRequests.delete(reqId);
             }
-        }, 30000);
+        }, 15000);
     });
 });
 
@@ -104,27 +98,28 @@ const wss = new WebSocket.Server({ noServer: true });
 server.on('upgrade', (request, socket, head) => {
     wss.handleUpgrade(request, socket, head, (ws) => {
         localClientSocket = ws;
-        console.log('⚡ تم ربط العميل المحلي بنجاح!');
+        console.log('⚡ تم ربط الكلاينت المحلي بالنفق!');
 
         ws.on('message', (message) => {
             try {
                 const responseData = JSON.parse(message.toString());
+                if (!responseData.id) return; // تجاهل أي رد لا يحتوي على ID
+
                 const res = pendingRequests.get(responseData.id);
-                
                 if (res) {
-                    const resBuffer = Buffer.from(responseData.body, 'base64');
+                    const resBuffer = Buffer.from(responseData.body || '', 'base64');
                     const cleanHeaders = { ...responseData.headers };
                     
                     delete cleanHeaders['transfer-encoding']; 
                     delete cleanHeaders['connection'];
                     cleanHeaders['content-length'] = resBuffer.length.toString();
 
-                    res.writeHead(responseData.status, cleanHeaders);
+                    res.writeHead(responseData.status || 200, cleanHeaders);
                     res.end(resBuffer);
                     pendingRequests.delete(responseData.id);
                 }
             } catch (error) {
-                console.error('خطأ في معالجة الرد:', error.message);
+                console.error('خطأ في الرد:', error.message);
             }
         });
 
