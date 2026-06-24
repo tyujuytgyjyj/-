@@ -4,9 +4,11 @@ const WebSocket = require('ws');
 const pendingRequests = new Map();
 
 const server = http.createServer((req, res) => {
-    if (req.url === '/health' || req.url === '/ping') {
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        return res.end('OK');
+    // 🌟 حل مشكلة فحص الصحة: إرجاع كود 200 للمسارات القياسية دائماً
+    // هذا يجعل Render يرى السيرفر شغالاً تماماً (Healthy) ولا يحظر اتصالاتك
+    if (req.url === '/' || req.url === '/health' || req.url === '/ping') {
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('🚀 سيرفر النفق يعمل بنجاح ومستعد لاستقبال الاتصالات.');
     }
 
     if (!localClientSocket || localClientSocket.readyState !== WebSocket.OPEN) {
@@ -47,7 +49,6 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ noServer: true });
 let localClientSocket = null;
 
-// نظام نبضات القلب
 setInterval(() => {
     wss.clients.forEach((ws) => {
         if (ws.isAlive === false) return ws.terminate();
@@ -57,10 +58,10 @@ setInterval(() => {
 }, 30000);
 
 server.on('upgrade', (request, socket, head) => {
-    // ⚠️ التأكد من أن الاتصال قادم حصراً للمسار السري الخاص بالنفق
-    if (request.url === '/_tunnel') {
+    // 🌟 جعل التحقق مرناً باستخدام startsWith لمنع الـ 502 الناتجة عن اختلاف صياغة الرابط
+    if (request.url && request.url.startsWith('/_tunnel')) {
         wss.handleUpgrade(request, socket, head, (ws) => {
-            console.log('⚡ جهازك المحلي (client.js) اتصل بالنفق بنجاح عبر المسار الآمن!');
+            console.log('⚡ جهازك المحلي اتصل بالنفق بنجاح!');
             
             if (localClientSocket && localClientSocket.readyState === WebSocket.OPEN) {
                 localClientSocket.close();
@@ -89,14 +90,12 @@ server.on('upgrade', (request, socket, head) => {
                         pendingRequests.delete(responseData.id);
                     }
                 } catch (error) {
-                    console.error('خطأ في معالجة رد العميل:', error.message);
+                    console.error('خطأ في معالجة الرد:', error.message);
                 }
             });
 
             ws.on('close', () => {
-                console.log('❌ انقطع اتصال الجهاز المحلي بالنفق.');
                 if (localClientSocket === ws) localClientSocket = null;
-                
                 pendingRequests.forEach((res) => {
                     if (!res.headersSent) {
                         res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -107,8 +106,8 @@ server.on('upgrade', (request, socket, head) => {
             });
         });
     } else {
-        // إذا كان الاتصال قادم من المتصفح (مثل تحديث تلقائي للمشروع Hot Reload)
-        // نقوم بقطع الاتصال فوراً لحماية استقرار النفق الرئيسي
+        // رفض نظيف وصريح لأي طلبات اتصال عشوائية من المتصفح
+        socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
         socket.destroy();
     }
 });
