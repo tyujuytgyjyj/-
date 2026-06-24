@@ -6,15 +6,15 @@ const PORT = process.env.PORT || 10000;
 const pendingRequests = new Map();
 let activeClient = null;
 
-// 1. إنشاء سيرفر HTTP لاستقبال طلبات الزوار
+// 1. استقبال طلبات الـ HTTP من المتصفح
 const server = http.createServer((req, res) => {
-    // إذا كان جهازك المحلي غير متصل بالنفق، نرد فوراً بـ 502 بدل التعليق
+    // إذا كان العميل غير متصل أو الاتصال ميت، نرد فوراً بـ 502 بدلاً من التعليق
     if (!activeClient || activeClient.readyState !== 1) {
         res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-        return res.end('502 Bad Gateway: جهازك المحلي غير متصل بالنفق حالياً.');
+        return res.end('502 Bad Gateway: جهازك المحلي غير متصل بالنفق حالياً أو في حالة خمول.');
     }
 
-    const requestId = crypto.randomUUID(); // توليد ID فريد لكل طلب
+    const requestId = crypto.randomUUID();
     const chunks = [];
 
     req.on('data', chunk => chunks.push(chunk));
@@ -26,28 +26,43 @@ const server = http.createServer((req, res) => {
             method: req.method,
             url: req.url,
             headers: req.headers,
-            body: bodyBuffer.toString('base64') // تحويل البودي لـ base64 لحمايته من التلف
+            body: bodyBuffer.toString('base64')
         };
 
-        // حماية قصوى: إذا لم يستجب جهازك خلال 20 ثانية، ننهي الطلب لمنع الـ 504
+        // 🌟 حماية قصوى: مهلة 15 ثانية فقط لقطع الشك باليقين والرد قبل أن يتدخل سيرفر Render بـ 504
         const timeout = setTimeout(() => {
             if (pendingRequests.has(requestId)) {
                 const pending = pendingRequests.get(requestId);
-                pending.res.writeHead(504, { 'Content-Type': 'text/plain; charset=utf-8' });
-                pending.res.end('504 Gateway Timeout: السيرفر المحلي استغرق وقتاً طويلاً في الاستجابة.');
+                try {
+                    pending.res.writeHead(504, { 'Content-Type': 'text/plain; charset=utf-8' });
+                    pending.res.end('504 Gateway Timeout: السيرفر المحلي استغرق وقتاً طويلاً جداً ولم يستجب.');
+                } catch (e) {}
                 pendingRequests.delete(requestId);
             }
-        }, 20000);
+        }, 15000);
 
-        // حفظ استجابة الـ HTTP في الذاكرة لربطها لاحقاً برد الـ WebSocket
         pendingRequests.set(requestId, { res, timeout });
         
-        // إرسال الطلب فوراً لجهازك عبر النفق
-        activeClient.send(JSON.stringify(requestData));
+        // إرسال الطلب مع فحص فوري لوجود خطأ في الإرسال
+        try {
+            activeClient.send(JSON.stringify(requestData), (err) => {
+                if (err) {
+                    clearTimeout(timeout);
+                    res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+                    res.end('502 Bad Gateway: فشل إرسال البيانات عبر النفق الميت.');
+                    pendingRequests.delete(requestId);
+                }
+            });
+        } catch (err) {
+            clearTimeout(timeout);
+            res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end('502 Bad Gateway: خطأ غير متوقع في قناة الاتصال.');
+            pendingRequests.delete(requestId);
+        }
     });
 });
 
-// 2. دمج سيرفر الـ WebSocket مع سيرفر الـ HTTP
+// 2. دمج الـ WebSocketServer
 const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (request, socket, head) => {
@@ -59,6 +74,21 @@ server.on('upgrade', (request, socket, head) => {
 wss.on('connection', (ws) => {
     console.log('🟩 تم ربط جهازك المحلي بالنفق بنجاح!');
     activeClient = ws;
+    ws.isAlive = true;
+
+    // 🌟 نظام نبضات القلب (Heartbeat): للتأكد التام أن الاتصال حقيقي وليس وهمياً
+    const pingInterval = setInterval(() => {
+        if (ws.isAlive === false) {
+            console.log('🟥 العميل لم يستجب للـ Ping. يتم إغلاق الاتصال الميت فوراً.');
+            return ws.terminate();
+        }
+        ws.isAlive = false;
+        try { ws.ping(); } catch (e) { ws.terminate(); }
+    }, 30000); // يفحص كل 30 ثانية
+
+    ws.on('pong', () => {
+        ws.isAlive = true; // العميل رد بأنه حي، الاتصال سليم!
+    });
 
     ws.on('message', (message) => {
         try {
@@ -66,16 +96,13 @@ wss.on('connection', (ws) => {
             const pending = pendingRequests.get(responseData.id);
 
             if (pending) {
-                clearTimeout(pending.timeout); // إلغاء التايم آوت فوراً لوصول الرد
+                clearTimeout(pending.timeout); // إلغاء التايم آوت فوراً
                 
                 const headers = responseData.headers || {};
-                // تنظيف الهيدرز لمنع تعليق المتصفح
                 delete headers['connection'];
                 delete headers['transfer-encoding'];
 
                 pending.res.writeHead(responseData.status || 200, headers);
-                
-                // تحويل الرد القادم من جهازك من base64 إلى ملفات أصيلة (صور، نصوص، كود)
                 const bodyBuffer = Buffer.from(responseData.body || '', 'base64');
                 pending.res.end(bodyBuffer);
                 
@@ -88,7 +115,13 @@ wss.on('connection', (ws) => {
 
     ws.on('close', () => {
         console.log('🟥 انقطع اتصال الجهاز المحلي بالنفق.');
+        clearInterval(pingInterval);
         if (activeClient === ws) activeClient = null;
+    });
+
+    ws.on('error', (err) => {
+        console.error('🚨 خطأ في سوكت العميل:', err.message);
+        ws.terminate();
     });
 });
 
