@@ -4,7 +4,6 @@ const WebSocket = require('ws');
 const pendingRequests = new Map();
 
 const server = http.createServer((req, res) => {
-    // مسار فحص الصحة الخاص بـ Render
     if (req.url === '/health' || req.url === '/ping') {
         res.writeHead(200, { 'Content-Type': 'text/plain' });
         return res.end('OK');
@@ -15,7 +14,6 @@ const server = http.createServer((req, res) => {
         return res.end('502 Bad Gateway: الجهاز المحلي غير متصل بالنفق حالياً.');
     }
 
-    // تجميع البيانات كـ Buffer (وليس كـ String) لدعم الصور والملفات دون تلف
     let chunks = [];
     req.on('data', chunk => chunks.push(chunk));
     req.on('end', () => {
@@ -27,19 +25,18 @@ const server = http.createServer((req, res) => {
             method: req.method,
             url: req.url,
             headers: req.headers,
-            body: bodyBuffer.toString('base64') // تشفير آمن لنقل البيانات عبر الـ WebSocket
+            body: bodyBuffer.toString('base64')
         };
 
         pendingRequests.set(reqId, res);
         localClientSocket.send(JSON.stringify(requestData));
 
-        // مهلة زمنية 30 ثانية
         setTimeout(() => {
             if (pendingRequests.has(reqId)) {
                 const resObj = pendingRequests.get(reqId);
                 if (!resObj.headersSent) {
-                    resObj.writeHead(504, { 'Content-Type': 'text/plain' });
-                    resObj.end('504 Gateway Timeout: الجهاز المحلي استغرق وقتاً طويلاً للرد.');
+                    resObj.writeHead(504, { 'Content-Type': 'text/plain; charset=utf-8' });
+                    resObj.end('504 Gateway Timeout: استغرق الجهاز المحلي وقتاً طويلاً للاستجابة.');
                 }
                 pendingRequests.delete(reqId);
             }
@@ -50,7 +47,7 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ noServer: true });
 let localClientSocket = null;
 
-// نبضات القلب لمنع فصل الاتصال تلقائياً
+// نظام نبضات القلب
 setInterval(() => {
     wss.clients.forEach((ws) => {
         if (ws.isAlive === false) return ws.terminate();
@@ -60,49 +57,60 @@ setInterval(() => {
 }, 30000);
 
 server.on('upgrade', (request, socket, head) => {
-    wss.handleUpgrade(request, socket, head, (ws) => {
-        if (localClientSocket && localClientSocket.readyState === WebSocket.OPEN) {
-            localClientSocket.close();
-        }
-        localClientSocket = ws;
-        ws.isAlive = true;
-
-        ws.on('pong', () => ws.isAlive = true);
-
-        ws.on('message', (message) => {
-            try {
-                const responseData = JSON.parse(message.toString());
-                const res = pendingRequests.get(responseData.id);
-                
-                if (res) {
-                    const resBuffer = Buffer.from(responseData.body, 'base64');
-                    
-                    // تنظيف الـ Headers القادمة وإجبار السيرفر على احتساب الحجم الفعلي الجديد
-                    const cleanHeaders = { ...responseData.headers };
-                    delete cleanHeaders['transfer-encoding']; 
-                    delete cleanHeaders['connection'];
-                    cleanHeaders['content-length'] = resBuffer.length.toString();
-
-                    res.writeHead(responseData.status, cleanHeaders);
-                    res.end(resBuffer);
-                    pendingRequests.delete(responseData.id);
-                }
-            } catch (error) {
-                console.error('خطأ في معالجة الرد الزائر:', error.message);
+    // ⚠️ التأكد من أن الاتصال قادم حصراً للمسار السري الخاص بالنفق
+    if (request.url === '/_tunnel') {
+        wss.handleUpgrade(request, socket, head, (ws) => {
+            console.log('⚡ جهازك المحلي (client.js) اتصل بالنفق بنجاح عبر المسار الآمن!');
+            
+            if (localClientSocket && localClientSocket.readyState === WebSocket.OPEN) {
+                localClientSocket.close();
             }
-        });
+            
+            localClientSocket = ws;
+            ws.isAlive = true;
 
-        ws.on('close', () => {
-            if (localClientSocket === ws) localClientSocket = null;
-            pendingRequests.forEach((res) => {
-                if (!res.headersSent) {
-                    res.writeHead(502, { 'Content-Type': 'text/plain' });
-                    res.end('502 Bad Gateway: Connection Lost.');
+            ws.on('pong', () => ws.isAlive = true);
+
+            ws.on('message', (message) => {
+                try {
+                    const responseData = JSON.parse(message.toString());
+                    const res = pendingRequests.get(responseData.id);
+                    
+                    if (res) {
+                        const resBuffer = Buffer.from(responseData.body, 'base64');
+                        const cleanHeaders = { ...responseData.headers };
+                        
+                        delete cleanHeaders['transfer-encoding']; 
+                        delete cleanHeaders['connection'];
+                        cleanHeaders['content-length'] = resBuffer.length.toString();
+
+                        res.writeHead(responseData.status, cleanHeaders);
+                        res.end(resBuffer);
+                        pendingRequests.delete(responseData.id);
+                    }
+                } catch (error) {
+                    console.error('خطأ في معالجة رد العميل:', error.message);
                 }
             });
-            pendingRequests.clear();
+
+            ws.on('close', () => {
+                console.log('❌ انقطع اتصال الجهاز المحلي بالنفق.');
+                if (localClientSocket === ws) localClientSocket = null;
+                
+                pendingRequests.forEach((res) => {
+                    if (!res.headersSent) {
+                        res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+                        res.end('502 Bad Gateway: Connection Lost.');
+                    }
+                });
+                pendingRequests.clear();
+            });
         });
-    });
+    } else {
+        // إذا كان الاتصال قادم من المتصفح (مثل تحديث تلقائي للمشروع Hot Reload)
+        // نقوم بقطع الاتصال فوراً لحماية استقرار النفق الرئيسي
+        socket.destroy();
+    }
 });
 
 const PORT = process.env.PORT || 3000;
