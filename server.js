@@ -1,105 +1,46 @@
 const http = require('http');
+const httpProxy = require('http-proxy');
 const { WebSocketServer } = require('ws');
-const crypto = require('crypto');
 
 const PORT = process.env.PORT || 10000;
-const pendingRequests = new Map();
-let activeClient = null;
+
+// إنشاء الـ Proxy المفتوح المصدر
+const proxy = httpProxy.createProxyServer({
+    target: {
+        host: '127.0.0.1',
+        port: 4000 // البورت الافتراضي لمشروعك
+    },
+    ws: true
+});
 
 const server = http.createServer((req, res) => {
-    // حماية: إذا حاول متصفح دخول مسار النفق بالخطأ نمنعه
-    if (req.url === '/tunnel-secure') {
-        res.writeHead(400);
-        return res.end('WS connection required');
-    }
-
-    // إذا كان النفق مغلقاً أو العميل غير متصل
-    if (!activeClient || activeClient.readyState !== 1) {
-        res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-        return res.end('502 Bad Gateway: النفق مغلق تماماً، تأكد من تشغيل ملف client.js الجديد في جهازك.');
-    }
-
-    const requestId = crypto.randomUUID();
-    const chunks = [];
-    req.on('data', chunk => chunks.push(chunk));
-    req.on('end', () => {
-        const bodyBuffer = Buffer.concat(chunks);
-        const requestData = {
-            id: requestId,
-            method: req.method,
-            url: req.url,
-            headers: req.headers,
-            body: bodyBuffer.toString('base64')
-        };
-
-        const timeout = setTimeout(() => {
-            if (pendingRequests.has(requestId)) {
-                const pending = pendingRequests.get(requestId);
-                try {
-                    pending.res.writeHead(504, { 'Content-Type': 'text/plain; charset=utf-8' });
-                    pending.res.end('504 Gateway Timeout: المشروع المحلي على بورت 4000 لم يستجب.');
-                } catch(e){}
-                pendingRequests.delete(requestId);
-            }
-        }, 15000);
-
-        pendingRequests.set(requestId, { res, timeout });
-        try {
-            activeClient.send(JSON.stringify(requestData));
-        } catch (err) {
-            clearTimeout(timeout);
+    // هنا يتم تمرير أي طلب قادم من الإنترنت تلقائياً إلى التفق
+    if (activeTargetSocket && activeTargetSocket.readyState === 1) {
+        // توجيه الطلب عبر البروكسي
+        proxy.web(req, res, { target: 'http://127.0.0.1:4000' }, (err) => {
             res.writeHead(502);
-            res.end('502 Bad Gateway: انقطع الاتصال بالنفق.');
-            pendingRequests.delete(requestId);
-        }
-    });
-});
-
-// إعداد سوكت معزول وخاص بطلب الـ Upgrade يدوياً ليتوافق 100% مع بيئة Render
-const wss = new WebSocketServer({ noServer: true });
-
-server.on('upgrade', (request, socket, head) => {
-    if (request.url === '/tunnel-secure') {
-        wss.handleUpgrade(request, socket, head, (ws) => {
-            wss.emit('connection', ws, request);
+            res.end('Reverse Proxy Error');
         });
     } else {
-        socket.destroy();
+        res.writeHead(502);
+        res.end('502 Bad Gateway: Local tunnel client is offline.');
     }
 });
 
-wss.on('connection', (ws) => {
-    console.log('🟩 [Render] تم فتح النفق بنجاح واستقبال اتصال جهازك المحلي.');
-    activeClient = ws;
+// فتح سوكت مخصص فقط لربط جهازك المحلي بالسيرفر
+const wss = new WebSocketServer({ noServer: true });
+let activeTargetSocket = null;
 
-    ws.on('message', (message) => {
-        try {
-            const data = JSON.parse(message.toString());
-            
-            // الرد الفوري على نبضات القلب القادمة من جهازك لتبقي الخط مفتوحاً رغماً عن جدار الحماية
-            if (data.type === 'ping') {
-                ws.send(JSON.stringify({ type: 'pong' }));
-                return;
-            }
-
-            const pending = pendingRequests.get(data.id);
-            if (pending) {
-                clearTimeout(pending.timeout);
-                const headers = data.headers || {};
-                delete headers['connection'];
-                delete headers['transfer-encoding'];
-                pending.res.writeHead(data.status || 200, headers);
-                pending.res.end(Buffer.from(data.body || '', 'base64'));
-                pendingRequests.delete(data.id);
-            }
-        } catch (err) {}
-    });
-
-    ws.on('close', () => {
-        if (activeClient === ws) activeClient = null;
-    });
+server.on('upgrade', (request, socket, head) => {
+    if (request.url === '/tunnel-connect') {
+        wss.handleUpgrade(request, socket, head, (ws) => {
+            activeTargetSocket = ws;
+            console.log('🟩 الجهاز المحلي متصل بالبروكسي بنجاح!');
+        });
+    } else {
+        // إذا كان الطلب عبارة عن WebSocket عادي من مشروعك (بورت 4000)
+        proxy.ws(request, socket, head);
+    }
 });
 
-process.on('uncaughtException', (err) => console.error('Global Error:', err.message));
-
-server.listen(PORT, () => console.log(`🚀 Tunnel Server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Open-Source Proxy running on port ${PORT}`));
