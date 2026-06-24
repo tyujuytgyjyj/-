@@ -4,11 +4,10 @@ const WebSocket = require('ws');
 const pendingRequests = new Map();
 
 const server = http.createServer((req, res) => {
-    // 🌟 حل مشكلة فحص الصحة: إرجاع كود 200 للمسارات القياسية دائماً
-    // هذا يجعل Render يرى السيرفر شغالاً تماماً (Healthy) ولا يحظر اتصالاتك
+    // فحص الصحة القياسي لـ Render ليبقى السيرفر يعمل دائماً بوضع Live
     if (req.url === '/' || req.url === '/health' || req.url === '/ping') {
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-        return res.end('🚀 سيرفر النفق يعمل بنجاح ومستعد لاستقبال الاتصالات.');
+        return res.end('🚀 سيرفر النفق يعمل بنجاح ومستعد لاستقبال الاتصالات الموثقة.');
     }
 
     if (!localClientSocket || localClientSocket.readyState !== WebSocket.OPEN) {
@@ -58,10 +57,10 @@ setInterval(() => {
 }, 30000);
 
 server.on('upgrade', (request, socket, head) => {
-    // 🌟 جعل التحقق مرناً باستخدام startsWith لمنع الـ 502 الناتجة عن اختلاف صياغة الرابط
-    if (request.url && request.url.startsWith('/_tunnel')) {
+    // 🌟 الحل السحري: التحقق من الهيدر السري القادم من جهازك مباشرة وحصراً
+    if (request.headers['x-tunnel-auth'] === 'my-super-secret-token-123') {
         wss.handleUpgrade(request, socket, head, (ws) => {
-            console.log('⚡ جهازك المحلي اتصل بالنفق بنجاح!');
+            console.log('⚡ تم ربط العميل المحلي بالنفق الخارجي بنجاح تام وبشكل آمن!');
             
             if (localClientSocket && localClientSocket.readyState === WebSocket.OPEN) {
                 localClientSocket.close();
@@ -106,8 +105,8 @@ server.on('upgrade', (request, socket, head) => {
             });
         });
     } else {
-        // رفض نظيف وصريح لأي طلبات اتصال عشوائية من المتصفح
-        socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+        // رفض اتصالات المتصفح العشوائية (مثل اسكربتات التحديث التلقائي) بكود 401 غير مصرح له لحماية النفق
+        socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
         socket.destroy();
     }
 });
