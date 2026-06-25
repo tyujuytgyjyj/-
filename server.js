@@ -2,7 +2,7 @@ const http = require('http');
 const WebSocket = require('ws');
 const crypto = require('crypto');
 
-// 🛡️ درع حماية للسيرفر عشان ما يطفيش أبداً
+// 🛡️ درع حماية للسيرفر
 process.on('uncaughtException', (err) => {
     console.error('🔥 [حماية] السيرفر مستمر رغم الخطأ:', err.message);
 });
@@ -36,6 +36,13 @@ const server = http.createServer((req, res) => {
             localClientSocket.send(JSON.stringify(requestData));
         }
     });
+
+    // 🌟 حماية جديدة: لو المتصفح قفل الصفحة، احذف الطلب عشان السيرفر ميعلقش
+    req.on('close', () => {
+        if (!res.writableEnded) {
+            pendingRequests.delete(reqId);
+        }
+    });
 });
 
 const wss = new WebSocket.Server({ noServer: true });
@@ -50,13 +57,12 @@ server.on('upgrade', (request, socket, head) => {
                 const responseData = JSON.parse(message.toString());
                 const originalRes = pendingRequests.get(responseData.id); 
 
-                if (originalRes) {
+                if (originalRes && !originalRes.writableEnded) {
                     let finalBody = responseData.body || '';
                     if (responseData.isBase64 && responseData.body) {
                         finalBody = Buffer.from(responseData.body, 'base64');
                     }
 
-                    // إرسال الرد للمتصفح
                     originalRes.writeHead(responseData.status, responseData.headers);
                     originalRes.end(finalBody);
                     
@@ -71,9 +77,8 @@ server.on('upgrade', (request, socket, head) => {
             console.log('🟥 الكلاينت فصل الاتصال. جاري تفريغ الطلبات المعلقة...');
             localClientSocket = null;
             
-            // 🌟 إغلاق أي طلب معلق عشان المتصفح ما يفضلش يحمل للأبد
             for (const [id, res] of pendingRequests.entries()) {
-                if (!res.headersSent) {
+                if (!res.headersSent && !res.writableEnded) {
                     res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
                     res.end('502 Bad Gateway: انقطع الاتصال بالكلاينت المحلي فجأة.');
                 }
