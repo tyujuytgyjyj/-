@@ -2,6 +2,7 @@ const http = require('http');
 const WebSocket = require('ws');
 const crypto = require('crypto');
 
+// 🛡️ درع حماية للسيرفر
 process.on('uncaughtException', (err) => {
     console.error('🔥 [حماية] السيرفر مستمر رغم الخطأ:', err.message);
 });
@@ -11,16 +12,13 @@ let localClientSocket = null;
 
 const server = http.createServer((req, res) => {
     if (!localClientSocket || localClientSocket.readyState !== WebSocket.OPEN) {
-        if (!res.headersSent) {
-            res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-            return res.end('502 Bad Gateway: الجهاز المحلي غير متصل.');
-        }
-        return;
+        res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('502 Bad Gateway: الجهاز المحلي غير متصل.');
     }
 
     const reqId = crypto.randomUUID();
+
     let bodyChunks = [];
-    
     req.on('data', chunk => bodyChunks.push(chunk));
     req.on('end', () => {
         const requestData = {
@@ -39,7 +37,7 @@ const server = http.createServer((req, res) => {
         }
     });
 
-    // تفريغ الطلب لو المتصفح قفل من ناحيته
+    // 🌟 حماية جديدة: لو المتصفح قفل الصفحة، احذف الطلب عشان السيرفر ميعلقش
     req.on('close', () => {
         if (!res.writableEnded) {
             pendingRequests.delete(reqId);
@@ -65,9 +63,7 @@ server.on('upgrade', (request, socket, head) => {
                         finalBody = Buffer.from(responseData.body, 'base64');
                     }
 
-                    if (!originalRes.headersSent) {
-                        originalRes.writeHead(responseData.status, responseData.headers);
-                    }
+                    originalRes.writeHead(responseData.status, responseData.headers);
                     originalRes.end(finalBody);
                     
                     pendingRequests.delete(responseData.id);
