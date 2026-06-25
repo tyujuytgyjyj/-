@@ -2,45 +2,95 @@ const http = require('http');
 const WebSocket = require('ws');
 const crypto = require('crypto');
 
-const server = http.createServer((req, res) => {
-    // التحقق من وجود اتصال كلاينت
-    if (!wss.clients.size) {
-        res.writeHead(502);
-        return res.end('Client Not Connected');
-    }
-
-    const id = crypto.randomUUID();
-    const chunks = [];
-    req.on('data', c => chunks.push(c));
-    req.on('end', () => {
-        const client = [...wss.clients][0];
-        client.send(JSON.stringify({
-            id, method: req.method, url: req.url, headers: req.headers,
-            body: Buffer.concat(chunks).toString('base64')
-        }));
-        pendingRequests.set(id, res);
-    });
+process.on('uncaughtException', (err) => {
+    console.error('🔥 [حماية] السيرفر مستمر رغم الخطأ:', err.message);
 });
 
-const wss = new WebSocket.Server({ server });
-const pendingRequests = new Map();
+const pendingRequests = new Map(); 
+let localClientSocket = null;
 
-wss.on('connection', (ws) => {
-    console.log('🔗 Client Connected');
-    ws.on('message', (msg) => {
-        const resData = JSON.parse(msg);
-        const res = pendingRequests.get(resData.id);
-        if (res) {
-            res.writeHead(resData.status, resData.headers);
-            res.end(Buffer.from(resData.body, 'base64'));
-            pendingRequests.delete(resData.id);
+const server = http.createServer((req, res) => {
+    if (!localClientSocket || localClientSocket.readyState !== WebSocket.OPEN) {
+        if (!res.headersSent) {
+            res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+            return res.end('502 Bad Gateway: الجهاز المحلي غير متصل.');
+        }
+        return;
+    }
+
+    const reqId = crypto.randomUUID();
+    let bodyChunks = [];
+    
+    req.on('data', chunk => bodyChunks.push(chunk));
+    req.on('end', () => {
+        const requestData = {
+            id: reqId,
+            method: req.method,
+            url: req.url,
+            headers: req.headers,
+            body: Buffer.concat(bodyChunks).toString('base64'),
+            isBodyBase64: true
+        };
+
+        pendingRequests.set(reqId, res);
+        
+        if (localClientSocket && localClientSocket.readyState === WebSocket.OPEN) {
+            localClientSocket.send(JSON.stringify(requestData));
+        }
+    });
+
+    // تفريغ الطلب لو المتصفح قفل من ناحيته
+    req.on('close', () => {
+        if (!res.writableEnded) {
+            pendingRequests.delete(reqId);
         }
     });
 });
 
-// تفعيل Ping لمنع Render من غلق الاتصال
-setInterval(() => {
-    wss.clients.forEach(ws => ws.ping());
-}, 25000);
+const wss = new WebSocket.Server({ noServer: true });
 
-server.listen(process.env.PORT || 3000);
+server.on('upgrade', (request, socket, head) => {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+        localClientSocket = ws;
+        console.log('🟩 تم ربط الكلاينت المحلي بنجاح!');
+
+        ws.on('message', (message) => {
+            try {
+                const responseData = JSON.parse(message.toString());
+                const originalRes = pendingRequests.get(responseData.id); 
+
+                if (originalRes && !originalRes.writableEnded) {
+                    let finalBody = responseData.body || '';
+                    if (responseData.isBase64 && responseData.body) {
+                        finalBody = Buffer.from(responseData.body, 'base64');
+                    }
+
+                    if (!originalRes.headersSent) {
+                        originalRes.writeHead(responseData.status, responseData.headers);
+                    }
+                    originalRes.end(finalBody);
+                    
+                    pendingRequests.delete(responseData.id);
+                }
+            } catch (e) {
+                console.error('خطأ في معالجة الرد:', e.message);
+            }
+        });
+
+        ws.on('close', () => {
+            console.log('🟥 الكلاينت فصل الاتصال. جاري تفريغ الطلبات المعلقة...');
+            localClientSocket = null;
+            
+            for (const [id, res] of pendingRequests.entries()) {
+                if (!res.headersSent && !res.writableEnded) {
+                    res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+                    res.end('502 Bad Gateway: انقطع الاتصال بالكلاينت المحلي فجأة.');
+                }
+            }
+            pendingRequests.clear();
+        });
+    });
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => { console.log(`🚀 Proxy running on port ${PORT}`); });
