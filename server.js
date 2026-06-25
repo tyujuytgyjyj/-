@@ -7,23 +7,37 @@ const server = http.createServer((req, res) => {
         return res.end('Bad Gateway: Local machine is offline.');
     }
 
-    let body = '';
-    req.on('data', chunk => body += chunk);
+    // تجميع الـ Body كـ Buffer لضمان وصول بيانات الـ POST (مثل تسجيل الدخول) سليمة 100%
+    let bodyChunks = [];
+    req.on('data', chunk => bodyChunks.push(chunk));
     req.on('end', () => {
         const requestData = {
             method: req.method,
             url: req.url,
             headers: req.headers,
-            body: body
+            body: Buffer.concat(bodyChunks).toString('base64'), // تشفير آمن لنقل البيانات
+            isBodyBase64: true
         };
 
         localClientSocket.send(JSON.stringify(requestData));
 
         const responseHandler = (message) => {
-            const responseData = JSON.parse(message);
-            res.writeHead(responseData.status, responseData.headers);
-            res.end(responseData.body);
-            localClientSocket.off('message', responseHandler);
+            try {
+                const responseData = JSON.parse(message);
+                
+                // فك تشفير الرد
+                let finalBody = responseData.body;
+                if (responseData.isBase64 && responseData.body) {
+                    finalBody = Buffer.from(responseData.body, 'base64');
+                }
+
+                // تمرير الـ Headers والـ Cookies القادمة من السيرفر المحلي للمتصفح بدقة
+                res.writeHead(responseData.status, responseData.headers);
+                res.end(finalBody);
+                localClientSocket.off('message', responseHandler);
+            } catch (e) {
+                // تجنب التداخل
+            }
         };
         localClientSocket.on('message', responseHandler);
     });
@@ -34,17 +48,10 @@ let localClientSocket = null;
 
 server.on('upgrade', (request, socket, head) => {
     wss.handleUpgrade(request, socket, head, (ws) => {
-        console.log('⚡ جهازك المحلي اتصل بالنفق بنجاح!');
         localClientSocket = ws;
-        
-        ws.on('close', () => {
-            console.log('❌ انقطع اتصال الجهاز المحلي.');
-            localClientSocket = null;
-        });
+        ws.on('close', () => { localClientSocket = null; });
     });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`🚀 Proxy running on port ${PORT}`);
-});
+server.listen(PORT, () => { console.log(`🚀 Proxy running on port ${PORT}`); });
