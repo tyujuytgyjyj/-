@@ -1,8 +1,13 @@
 const http = require('http');
 const WebSocket = require('ws');
-const crypto = require('crypto'); // لاستخراج ID فريد لكل طلب
+const crypto = require('crypto');
 
-const pendingRequests = new Map(); // خزانة لحفظ الطلبات
+// 🛡️ درع حماية للسيرفر عشان ما يطفيش أبداً
+process.on('uncaughtException', (err) => {
+    console.error('🔥 [حماية] السيرفر مستمر رغم الخطأ:', err.message);
+});
+
+const pendingRequests = new Map(); 
 let localClientSocket = null;
 
 const server = http.createServer((req, res) => {
@@ -11,14 +16,13 @@ const server = http.createServer((req, res) => {
         return res.end('502 Bad Gateway: الجهاز المحلي غير متصل.');
     }
 
-    // 🌟 إنشاء ID فريد لهذا الطلب بالذات
     const reqId = crypto.randomUUID();
 
     let bodyChunks = [];
     req.on('data', chunk => bodyChunks.push(chunk));
     req.on('end', () => {
         const requestData = {
-            id: reqId, // إرسال الـ ID للعميل
+            id: reqId,
             method: req.method,
             url: req.url,
             headers: req.headers,
@@ -26,9 +30,11 @@ const server = http.createServer((req, res) => {
             isBodyBase64: true
         };
 
-        // حفظ الطلب في الخزانة لحين عودة الرد من جهازك
         pendingRequests.set(reqId, res);
-        localClientSocket.send(JSON.stringify(requestData));
+        
+        if (localClientSocket && localClientSocket.readyState === WebSocket.OPEN) {
+            localClientSocket.send(JSON.stringify(requestData));
+        }
     });
 });
 
@@ -39,11 +45,10 @@ server.on('upgrade', (request, socket, head) => {
         localClientSocket = ws;
         console.log('🟩 تم ربط الكلاينت المحلي بنجاح!');
 
-        // 🌟 مستمع واحد فقط لكل الرسائل (يفرزها حسب الـ ID)
         ws.on('message', (message) => {
             try {
                 const responseData = JSON.parse(message.toString());
-                const originalRes = pendingRequests.get(responseData.id); // البحث عن صاحب الطلب
+                const originalRes = pendingRequests.get(responseData.id); 
 
                 if (originalRes) {
                     let finalBody = responseData.body || '';
@@ -55,7 +60,6 @@ server.on('upgrade', (request, socket, head) => {
                     originalRes.writeHead(responseData.status, responseData.headers);
                     originalRes.end(finalBody);
                     
-                    // حذف الطلب من الخزانة بعد نجاحه
                     pendingRequests.delete(responseData.id);
                 }
             } catch (e) {
@@ -64,7 +68,16 @@ server.on('upgrade', (request, socket, head) => {
         });
 
         ws.on('close', () => {
+            console.log('🟥 الكلاينت فصل الاتصال. جاري تفريغ الطلبات المعلقة...');
             localClientSocket = null;
+            
+            // 🌟 إغلاق أي طلب معلق عشان المتصفح ما يفضلش يحمل للأبد
+            for (const [id, res] of pendingRequests.entries()) {
+                if (!res.headersSent) {
+                    res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+                    res.end('502 Bad Gateway: انقطع الاتصال بالكلاينت المحلي فجأة.');
+                }
+            }
             pendingRequests.clear();
         });
     });
