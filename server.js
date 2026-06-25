@@ -13,7 +13,7 @@ process.on('unhandledRejection', (err) => {
 // ⚙️ الإعدادات
 const PORT = process.env.PORT || 3000;
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
-const REQUEST_TIMEOUT_MS = 30000;       // ⏱️ timeout لكل طلب
+const REQUEST_TIMEOUT_MS = 60000;       // ⏱️ timeout لكل طلب (60s لدعم Socket.IO long-polling)
 const HEARTBEAT_INTERVAL_MS = 10000;    // 💓 فحص كل 10 ثوانٍ
 const MAX_QUEUE_WAIT_MS = 5000;         // 📥 انتظار الاتصال حتى 5 ثوانٍ (يكفي لإعادة اتصال Render)
 const MAX_BACKPRESSURE = 5 * 1024 * 1024; // 5MB
@@ -173,6 +173,16 @@ function removeFromAllPending(reqId) {
 const wss = new WebSocket.Server({ noServer: true });
 
 server.on('upgrade', (request, socket, head) => {
+    // 🚨 [CRITICAL FIX] Socket.IO WebSocket upgrades يجب رفضها فوراً
+    // لكي يقع Socket.IO تلقائياً على polling (الذي يعمل عبر HTTP proxy)
+    // لو لم نرفضها، الـ proxy سيعاملها كـ tunnel من client.js ويكسر كل شيء!
+    const upgradeUrl = request.url || '';
+    if (upgradeUrl.includes('/socket.io/')) {
+        socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+        socket.destroy();
+        return;
+    }
+
     if (AUTH_TOKEN) {
         const url = new URL(request.url, 'http://localhost');
         const token = url.searchParams.get('token') || request.headers['x-proxy-token'];
@@ -314,37 +324,3 @@ server.on('upgrade', (request, socket, head) => {
     });
 });
 
-// 🛠️ فشل كل الطلبات (للطوارئ فقط)
-function failAllPending(conn, status, message) {
-    if (!conn || !conn.pending) return;
-    for (const [id, pending] of conn.pending.entries()) {
-        if (pending.timer) clearTimeout(pending.timer);
-        if (!pending.res.headersSent && !pending.res.writableEnded) {
-            try {
-                pending.res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8' });
-                pending.res.end(message);
-            } catch (e) {}
-        }
-    }
-    conn.pending.clear();
-}
-
-// 📊 تقرير دوري
-setInterval(() => {
-    const pendingCount = activeConnection ? activeConnection.pending.size : 0;
-    const queueCount = connectionWaitQueue.length;
-    const connState = activeConnection
-        ? (activeConnection.ws.readyState === WebSocket.OPEN ? 'OPEN' : 'CLOSING/CLOSED')
-        : 'لا اتصال';
-    const bp = activeConnection ? activeConnection.ws.bufferedAmount : 0;
-    console.log(`📊 [status] اتصال: ${connState} | معلقة: ${pendingCount} | في الانتظار: ${queueCount} | bp: ${bp}B`);
-}, 30000);
-
-server.listen(PORT, () => {
-    console.log(`🚀 Proxy running on port ${PORT}`);
-    console.log(`   ⏱️  request timeout: ${REQUEST_TIMEOUT_MS}ms`);
-    console.log(`   💓 heartbeat: كل ${HEARTBEAT_INTERVAL_MS}ms`);
-    console.log(`   📥 queue wait: ${MAX_QUEUE_WAIT_MS}ms`);
-    console.log(`   🌊 max backpressure: ${MAX_BACKPRESSURE / 1024 / 1024}MB`);
-    if (AUTH_TOKEN) console.log(`   🔒 المصادقة بالتوكن مفعّلة`);
-});
