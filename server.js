@@ -2,64 +2,45 @@ const http = require('http');
 const WebSocket = require('ws');
 const crypto = require('crypto');
 
+// 🛡️ درع حماية شامل للسيرفر
 process.on('uncaughtException', (err) => {
     console.error('🔥 [حماية] السيرفر مستمر رغم الخطأ:', err.message);
 });
+process.on('unhandledRejection', (err) => {
+    console.error('🔥 [unhandledRejection]:', err);
+});
 
-// ─── الإعدادات ────────────────────────────────────────────────
-const REQUEST_TIMEOUT_MS = 25000; // 25 ثانية قبل إعطاء 504
-const HEARTBEAT_MS       = 15000; // فحص الاتصال كل 15 ثانية
+// ⚙️ إعدادات قابلة للتعديل عبر متغيرات البيئة
+const PORT = process.env.PORT || 3000;
+const AUTH_TOKEN = process.env.AUTH_TOKEN || ''; // ضع توكن سري هنا لتفعيل المصادقة
+const REQUEST_TIMEOUT_MS = 30000;       // ⏱️ timeout لكل طلب HTTP معلّق
+const HEARTBEAT_INTERVAL_MS = 15000;    // 💓 فحص الاتصال كل 15 ثانية
+const HEARTBEAT_TIMEOUT_MS = 10000;     // 💀 إذا لم يصل pong خلال 10 ثوانٍ = الاتصال ميت
 
-// ─── الحالة الداخلية ──────────────────────────────────────────
-const pendingRequests = new Map(); // { reqId → { res, timeoutHandle } }
-let localClientSocket = null;
-
-// ─── مساعدات ──────────────────────────────────────────────────
-
-function sendErrorResponse(res, code, message) {
-    try {
-        if (!res.headersSent && !res.writableEnded) {
-            res.writeHead(code, { 'Content-Type': 'text/plain; charset=utf-8' });
-            res.end(`${code}: ${message}`);
-        }
-    } catch (_) { /* تجاهل إذا كان الاتصال مغلقاً */ }
-}
-
-function cleanupRequest(reqId) {
-    const entry = pendingRequests.get(reqId);
-    if (entry) {
-        clearTimeout(entry.timeoutHandle);
-        pendingRequests.delete(reqId);
-    }
-    return entry || null;
-}
-
-// أرسل خطأ لجميع الطلبات المعلقة ونظف الخريطة
-function flushPendingRequests(code, message) {
-    for (const [, entry] of pendingRequests) {
-        clearTimeout(entry.timeoutHandle);
-        sendErrorResponse(entry.res, code, message);
-    }
-    pendingRequests.clear();
-}
-
-// ─── HTTP Server ──────────────────────────────────────────────
+// 🗂️ حالة الاتصال الحالي — كل اتصال له ID فريد لتفادي race condition
+let activeConnection = null;            // { id, ws, pending: Map<reqId, {res, timer}> }
 
 const server = http.createServer((req, res) => {
-    // --- فحص سريع: هل الكلاينت متصل؟ ---
-    if (!localClientSocket || localClientSocket.readyState !== WebSocket.OPEN) {
-        return sendErrorResponse(res, 502, 'الجهاز المحلي غير متصل.');
+    // 🔒 التحقق من وجود اتصال حي
+    if (!activeConnection || activeConnection.ws.readyState !== WebSocket.OPEN) {
+        res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('502 Bad Gateway: الجهاز المحلي غير متصل.');
     }
 
+    const conn = activeConnection;          // التقط لقطة للاتصال الحالي
     const reqId = crypto.randomUUID();
     const bodyChunks = [];
 
-    req.on('data', (chunk) => bodyChunks.push(chunk));
+    req.on('data', chunk => bodyChunks.push(chunk));
 
     req.on('end', () => {
-        // --- فحص ثانٍ بعد قراءة الجسم (قد يتغير الاتصال خلال القراءة) ---
-        if (!localClientSocket || localClientSocket.readyState !== WebSocket.OPEN) {
-            return sendErrorResponse(res, 502, 'الجهاز المحلي قطع الاتصال أثناء قراءة الطلب.');
+        // 🛡️ تحقق مجدداً أن الاتصال ما زال نفسه (لم يُستبدل بأحدث)
+        if (activeConnection !== conn || conn.ws.readyState !== WebSocket.OPEN) {
+            if (!res.writableEnded) {
+                res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+                res.end('502 Bad Gateway: انقطع الاتصال أثناء استلام الطلب.');
+            }
+            return;
         }
 
         const requestData = {
@@ -68,142 +49,181 @@ const server = http.createServer((req, res) => {
             url: req.url,
             headers: req.headers,
             body: Buffer.concat(bodyChunks).toString('base64'),
-            isBodyBase64: true,
+            isBodyBase64: true
         };
 
-        // ⏱ مؤقت: إذا لم يرد الكلاينت خلال REQUEST_TIMEOUT_MS → 504
-        const timeoutHandle = setTimeout(() => {
-            const entry = cleanupRequest(reqId);
-            if (entry) {
-                console.warn(`⏱ Timeout (504): ${req.method} ${req.url}`);
-                sendErrorResponse(entry.res, 504, 'Gateway Timeout: انتهت مهلة انتظار رد الكلاينت.');
+        // ⏱️ timer لقتل الطلب المعلّق تلقائياً (يمنع 504 للأبد)
+        const timer = setTimeout(() => {
+            const pending = conn.pending.get(reqId);
+            if (pending && !pending.res.writableEnded) {
+                console.error(`⏱️ [timeout] الطلب ${reqId} لم يصل رده خلال ${REQUEST_TIMEOUT_MS}ms`);
+                pending.res.writeHead(504, { 'Content-Type': 'text/plain; charset=utf-8' });
+                pending.res.end('504 Gateway Timeout: الكلاينت المحلي لم يرد في الوقت المحدد.');
             }
+            conn.pending.delete(reqId);
         }, REQUEST_TIMEOUT_MS);
 
-        pendingRequests.set(reqId, { res, timeoutHandle });
+        conn.pending.set(reqId, { res, timer });
 
-        // ✉️ أرسل الطلب للكلاينت عبر WebSocket مع معالجة الأخطاء
-        try {
-            localClientSocket.send(JSON.stringify(requestData));
-        } catch (err) {
-            console.error('❌ فشل إرسال الطلب عبر WebSocket:', err.message);
-            cleanupRequest(reqId);
-            sendErrorResponse(res, 502, `فشل إرسال الطلب: ${err.message}`);
+        // 📤 إرسال الطلب للكلاينت المحلي مع callback للتحقق من نجاح الإرسال
+        conn.ws.send(JSON.stringify(requestData), (sendErr) => {
+            if (sendErr) {
+                console.error(`📤 [send error] فشل إرسال الطلب ${reqId}:`, sendErr.message);
+                const pending = conn.pending.get(reqId);
+                if (pending && !pending.res.writableEnded) {
+                    clearTimeout(pending.timer);
+                    pending.res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+                    pending.res.end('502 Bad Gateway: فشل إرسال الطلب للكلاينت المحلي.');
+                }
+                conn.pending.delete(reqId);
+            }
+        });
+    });
+
+    // 🌟 لو المتصفح ألغى الطلب (أغلق الاتصال فعلياً قبل اكتمال الرد)
+    // ملاحظة هامة: في Node.js الحديث، 'close' على req يُطلق بعد end مباشرة، لذا نستخدم res.on('close')
+    res.on('close', () => {
+        // res.on('close') يُطلق فعلياً عند:
+        //   - إغلاق المتصفح للاتصال قبل اكتمال الرد (هذا ما نريد التقاطه)
+        //   - بعد res.end() بنجاح (لكن وقتها writableEnded = true فلن ندخل الشرط)
+        if (!res.writableEnded && conn.pending) {
+            const pending = conn.pending.get(reqId);
+            if (pending) {
+                clearTimeout(pending.timer);
+                conn.pending.delete(reqId);
+            }
         }
-    });
-
-    req.on('error', (err) => {
-        console.error('❌ خطأ في الطلب الوارد:', err.message);
-        cleanupRequest(reqId);
-        sendErrorResponse(res, 400, err.message);
-    });
-
-    // إذا أغلق المتصفح الصفحة قبل الرد، نظف المدخل لمنع تسرب الذاكرة
-    req.on('close', () => {
-        if (!res.writableEnded) cleanupRequest(reqId);
     });
 });
 
-// ─── WebSocket Server ─────────────────────────────────────────
-
+// 🔄 ترقية WebSocket مع مصادحة اختيارية بالتوكن
 const wss = new WebSocket.Server({ noServer: true });
 
 server.on('upgrade', (request, socket, head) => {
+    // 🔒 مصادحة بسيطة بالتوكن إن كان مفعّلاً
+    if (AUTH_TOKEN) {
+        const url = new URL(request.url, 'http://localhost');
+        const token = url.searchParams.get('token') || request.headers['x-proxy-token'];
+        if (token !== AUTH_TOKEN) {
+            socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+            socket.destroy();
+            return;
+        }
+    }
+
     wss.handleUpgrade(request, socket, head, (ws) => {
-        // إذا اتصل كلاينت جديد، أغلق القديم بدل ما يتعارضوا
-        if (localClientSocket && localClientSocket.readyState === WebSocket.OPEN) {
-            console.warn('⚠️ كلاينت جديد. إغلاق القديم...');
-            localClientSocket.close(1001, 'replaced by new client');
+        const connId = crypto.randomUUID();
+        const conn = {
+            id: connId,
+            ws: ws,
+            pending: new Map(),
+            isAlive: true,
+            heartbeatTimer: null,
+            heartbeatInterval: null
+        };
+
+        // 🚨 هام: استبدال الاتصال القديم بأمان (دون أن يمسح القديم حالة الجديد)
+        if (activeConnection && activeConnection.ws.readyState === WebSocket.OPEN) {
+            console.log('🔄 اتصال جديد وصل — استبدال القديم...');
+            // قتل heartbeat القديم قبل الاستبدال
+            if (activeConnection.heartbeatInterval) clearInterval(activeConnection.heartbeatInterval);
+            if (activeConnection.heartbeatTimer) clearTimeout(activeConnection.heartbeatTimer);
+            // فشل طلبات القديم بسرعة
+            failAllPending(activeConnection, 502, '502 Bad Gateway: تم استبدال الاتصال بآخر جديد.');
+            // إغلاق القديم بصمت
+            try { activeConnection.ws.removeAllListeners('close'); activeConnection.ws.close(); } catch (e) {}
         }
 
-        localClientSocket = ws;
-        ws.isAlive = true; // لـ heartbeat
-        console.log('🟩 تم ربط الكلاينت المحلي بنجاح!');
+        activeConnection = conn;
+        console.log(`🟩 [${connId.slice(0,8)}] تم ربط الكلاينت المحلي بنجاح!`);
 
-        ws.on('pong', () => { ws.isAlive = true; }); // رد على ping = الاتصال حي
-
-        ws.on('message', (rawMessage) => {
-            let responseData;
-            try {
-                responseData = JSON.parse(rawMessage.toString());
-            } catch (e) {
-                console.error('❌ رد غير قابل للتحليل:', e.message);
+        // 💓 نظام Heartbeat: اكتشاف الاتصالات النصف ميتة (Half-open)
+        conn.heartbeatInterval = setInterval(() => {
+            if (conn.ws.readyState !== WebSocket.OPEN) return;
+            if (!conn.isAlive) {
+                console.log(`💀 [${connId.slice(0,8)}] لم يصل pong — الاتصال ميت، إغلاق قسري.`);
+                conn.ws.terminate();
                 return;
             }
-
-            const entry = pendingRequests.get(responseData.id);
-            if (!entry) return; // انتهت مهلته أو تم تنظيفه مسبقاً
-
-            clearTimeout(entry.timeoutHandle);
-            pendingRequests.delete(responseData.id);
-
-            const { res } = entry;
-            if (res.writableEnded) return; // المتصفح قفل قبل الرد
-
-            // فك تشفير الجسم
-            let body;
-            if (responseData.isBase64 && responseData.body) {
-                body = Buffer.from(responseData.body, 'base64');
-            } else {
-                body = Buffer.from(responseData.body || '');
-            }
-
-            // تنظيف الهيدرز وإصلاح content-length
-            const headers = { ...(responseData.headers || {}) };
-            delete headers['transfer-encoding']; // لأن الجسم مجمّع بالكامل
-            headers['content-length'] = body.length;
-
+            conn.isAlive = false;
             try {
-                res.writeHead(responseData.status || 200, headers);
-                res.end(body);
+                conn.ws.ping();
             } catch (e) {
-                console.error('❌ خطأ في إرسال الرد للمتصفح:', e.message);
+                console.error('ping error:', e.message);
+            }
+        }, HEARTBEAT_INTERVAL_MS);
+
+        ws.on('pong', () => {
+            conn.isAlive = true;
+        });
+
+        ws.on('message', (message) => {
+            try {
+                const responseData = JSON.parse(message.toString());
+                const pending = conn.pending.get(responseData.id);
+                if (!pending) {
+                    // الطلب تم إلغاؤه أو انتهى timeout بالفعل — تجاهل
+                    return;
+                }
+                if (!pending.res.writableEnded) {
+                    let finalBody = responseData.body || '';
+                    if (responseData.isBase64 && responseData.body) {
+                        finalBody = Buffer.from(responseData.body, 'base64');
+                    }
+                    clearTimeout(pending.timer);
+                    pending.res.writeHead(responseData.status, responseData.headers);
+                    pending.res.end(finalBody);
+                }
+                conn.pending.delete(responseData.id);
+            } catch (e) {
+                console.error('خطأ في معالجة الرد:', e.message);
             }
         });
 
         ws.on('close', () => {
-            console.log('🟥 الكلاينت فصل الاتصال. تفريغ الطلبات المعلقة...');
-            if (localClientSocket === ws) localClientSocket = null;
-            flushPendingRequests(502, 'انقطع الاتصال بالكلاينت المحلي.');
+            console.log(`🟥 [${connId.slice(0,8)}] الكلاينت فصل الاتصال. تفريغ الطلبات المعلقة...`);
+            // 🛡️ فقط امسح activeConnection لو هو نفسه — تفادي race condition
+            if (activeConnection === conn) {
+                activeConnection = null;
+            }
+            if (conn.heartbeatInterval) clearInterval(conn.heartbeatInterval);
+            if (conn.heartbeatTimer) clearTimeout(conn.heartbeatTimer);
+            failAllPending(conn, 502, '502 Bad Gateway: انقطع الاتصال بالكلاينت المحلي فجأة.');
         });
 
         ws.on('error', (err) => {
-            console.error('❌ خطأ في WebSocket الكلاينت:', err.message);
+            console.error(`⚠️ [${connId.slice(0,8)}] ws error:`, err.message);
         });
     });
 });
 
-// ─── Heartbeat: كشف الاتصالات الميتة ─────────────────────────
-// بعض الأحيان readyState === OPEN بس الاتصال TCP مات من داخل
-// Ping/Pong كشف هذا خلال HEARTBEAT_MS
-
-const heartbeatInterval = setInterval(() => {
-    if (!localClientSocket) return;
-
-    if (!localClientSocket.isAlive) {
-        // لم يرد على آخر ping → اتصال ميت
-        console.warn('💔 الكلاينت لم يرد على Ping. إنهاء الاتصال الميت...');
-        localClientSocket.terminate();
-        localClientSocket = null;
-        flushPendingRequests(502, 'انقطع الاتصال (heartbeat فشل).');
-        return;
+// 🛠️ دالة مساعدة لفشل كل الطلبات المعلقة لاتصال معيّن
+function failAllPending(conn, status, message) {
+    if (!conn || !conn.pending) return;
+    for (const [id, pending] of conn.pending.entries()) {
+        if (pending.timer) clearTimeout(pending.timer);
+        if (!pending.res.headersSent && !pending.res.writableEnded) {
+            try {
+                pending.res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8' });
+                pending.res.end(message);
+            } catch (e) {}
+        }
     }
+    conn.pending.clear();
+}
 
-    // أرسل ping وانتظر pong
-    localClientSocket.isAlive = false;
-    try {
-        localClientSocket.ping();
-    } catch (err) {
-        console.error('❌ فشل إرسال Ping:', err.message);
-        localClientSocket.terminate();
-        localClientSocket = null;
-        flushPendingRequests(502, 'فشل heartbeat.');
-    }
-}, HEARTBEAT_MS);
+// 📊 تقرير دوري عن الحالة (للمراقبة)
+setInterval(() => {
+    const pendingCount = activeConnection ? activeConnection.pending.size : 0;
+    const connState = activeConnection
+        ? (activeConnection.ws.readyState === WebSocket.OPEN ? 'OPEN' : 'CLOSING/CLOSED')
+        : 'لا اتصال';
+    console.log(`📊 [status] اتصال: ${connState} | طلبات معلقة: ${pendingCount}`);
+}, 30000);
 
-server.on('close', () => clearInterval(heartbeatInterval));
-
-// ─── Start ────────────────────────────────────────────────────
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Proxy Server running on port ${PORT}`));
+server.listen(PORT, () => {
+    console.log(`🚀 Proxy running on port ${PORT}`);
+    console.log(`   ⏱️  request timeout: ${REQUEST_TIMEOUT_MS}ms`);
+    console.log(`   💓 heartbeat: كل ${HEARTBEAT_INTERVAL_MS}ms`);
+    if (AUTH_TOKEN) console.log(`   🔒 المصادقة بالتوكن مفعّلة`);
+});
